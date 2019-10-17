@@ -3,26 +3,21 @@ package mysqlstream
 import (
 	"fmt"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/OneOfOne/xxhash"
-
-	"github.com/moiot/gravity/pkg/config"
-
-	"github.com/mitchellh/hashstructure"
-
-	"github.com/pingcap/parser/ast"
-
-	"github.com/moiot/gravity/pkg/mysql"
-	"github.com/moiot/gravity/pkg/utils"
-
+	"github.com/cznic/mathutil"
 	"github.com/juju/errors"
+	"github.com/mitchellh/hashstructure"
+	"github.com/pingcap/parser/ast"
 	"github.com/siddontang/go-mysql/replication"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/moiot/gravity/pkg/config"
 	"github.com/moiot/gravity/pkg/core"
+	"github.com/moiot/gravity/pkg/mysql"
 	"github.com/moiot/gravity/pkg/schema_store"
+	"github.com/moiot/gravity/pkg/utils"
 )
 
 type binlogOp string
@@ -230,6 +225,9 @@ func NewUpdateMsgs(
 	}
 	return msgs, nil
 }
+
+const maxMediumintUnsigned int32 = 16777215
+
 func deserialize(raw interface{}, column schema_store.Column) interface{} {
 	// fix issue: https://github.com/siddontang/go-mysql/issues/242
 	if raw == nil {
@@ -237,8 +235,7 @@ func deserialize(raw interface{}, column schema_store.Column) interface{} {
 	}
 
 	ret := raw
-	ct := strings.ToLower(column.ColType)
-	if strings.Contains(ct, "text") || strings.Contains(ct, "char") || ct == "json" {
+	if column.Type == schema_store.TypeString || column.Type == schema_store.TypeJson {
 		_, ok := raw.([]uint8)
 		if ok {
 			ret = string(raw.([]uint8))
@@ -252,11 +249,14 @@ func deserialize(raw interface{}, column schema_store.Column) interface{} {
 		case int16:
 			ret = uint16(t)
 		case int32:
-			if strings.Contains(strings.ToLower(column.ColType), "mediumint") {
-				b0 := byte(t & 0xFF)
-				b1 := byte(t >> 8)
-				b2 := byte(t >> 16)
-				ret = uint32(uint32(b0) | uint32(b1)<<8 | uint32(b2)<<16)
+			if column.Type == schema_store.TypeMediumInt {
+				// problem with mediumint is that it's a 3-byte type. There is no compatible golang type to match that.
+				// So to convert from negative to positive we'd need to convert the value manually
+				if t >= 0 {
+					ret = uint32(t)
+				} else {
+					ret = uint32(maxMediumintUnsigned + t + 1)
+				}
 			} else {
 				ret = uint32(t)
 			}
@@ -290,7 +290,7 @@ func NewDeleteMsgs(
 
 	for rowIndex, row := range ev.Rows {
 		if len(row) != len(columns) {
-			return nil, errors.Errorf("delete %s.%s columns and data mismatch in length: %d vs %d",
+			log.Warnf("delete %s.%s columns and data mismatch in length: %d vs %d",
 				tableDef.Schema, tableDef.Name, len(columns), len(row))
 		}
 		msg := core.Msg{
@@ -309,7 +309,7 @@ func NewDeleteMsgs(
 		dmlMsg.Operation = core.Delete
 
 		data := make(map[string]interface{})
-		for i := 0; i < len(columns); i++ {
+		for i := 0; i < mathutil.Min(len(row), len(columns)); i++ {
 			data[columns[i].Name] = deserialize(row[i], columns[i])
 		}
 		dmlMsg.Data = data
@@ -337,8 +337,7 @@ func NewDDLMsg(
 	ast ast.StmtNode,
 	ddlSQL string,
 	ts int64,
-	received time.Time,
-	position config.MySQLBinlogPosition) *core.Msg {
+	received time.Time) *core.Msg {
 
 	return &core.Msg{
 		Phase: core.Phase{
@@ -350,7 +349,7 @@ func NewDDLMsg(
 		Table:               table,
 		DdlMsg:              &core.DDLMsg{Statement: ddlSQL, AST: ast},
 		Done:                make(chan struct{}),
-		InputContext:        inputContext{op: ddl, position: position},
+		InputContext:        inputContext{op: ddl},
 		InputStreamKey:      utils.NewStringPtr(inputStreamKey),
 		AfterCommitCallback: callback,
 	}

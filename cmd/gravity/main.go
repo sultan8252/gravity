@@ -23,6 +23,7 @@ import (
 	"github.com/moiot/gravity/pkg/config"
 	"github.com/moiot/gravity/pkg/consts"
 	"github.com/moiot/gravity/pkg/core"
+	_ "github.com/moiot/gravity/pkg/env"
 	"github.com/moiot/gravity/pkg/logutil"
 	"github.com/moiot/gravity/pkg/utils"
 )
@@ -91,11 +92,6 @@ func main() {
 		return
 	}
 
-	err = server.Start()
-	if err != nil {
-		log.Fatal(errors.ErrorStack(err))
-	}
-
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
 		http.HandleFunc("/reset", resetHandler(server, cfg.PipelineConfig))
@@ -107,6 +103,11 @@ func main() {
 		}
 		log.Info("starting http server")
 	}()
+
+	err = server.Start()
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {

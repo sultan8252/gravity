@@ -19,24 +19,23 @@ CREATE TABLE `test`.`test_target_table` (
 ```
 
 
-#### 编译 (TODO: 开源后直接从 github 下载 binary)
+#### 编译（可选，可以直接用 docker）
 
 首先，[配置好 Go 语言环境](https://golang.org/doc/install) 并编译
 
 
 ```bash
-mkdir -p $GOPATH/src/github.com/moiot/ && cd $GOPATH/src/github.com/moiot/
-
 git clone https://github.com/moiot/gravity.git
 
 cd gravity && make
-
 ```
 
+Gravity 使用了 [go mod](https://github.com/golang/go/wiki/Modules)，中国大陆地区用户建议设置 `export GOPROXY=https://goproxy.io` 或其他代理。
+将代码克隆到 GOPATH 路径下的用户需要设置 `export GO111MODULE=on`。
 
 #### MySQL 到 MySQL 同步
 
-创建如下配置文件 `mysql2mysql.toml`
+创建如下配置文件 `config.toml`
 
 ```toml
 # name 必填
@@ -76,17 +75,9 @@ target-schema = "test"
 target-table = "test_target_table"
 ```
 
-启动 `gravity`
-
-```bash
-bin/gravity -config mysql2mysql.toml
-```
-
-`test_source_table` 和 `test_target_table` 之间的同步已经开始，现在可以在源端插入数据，然后在目标端会看到相应的变化。
-
 #### MySQL 到 Kafka
 
-创建如下配置文件 `mysql2kafka.toml`
+创建如下配置文件 `config.toml`
 
 ```toml
 name = "mysql2kafkaDemo"
@@ -119,10 +110,17 @@ match-table = "test_source_table"
 dml-topic = "test"
 ```
 
-启动 `gravity`
-
+## 启动 gravity
+从编译完的程序
 ```bash
-bin/gravity -config mysql2kafka.toml
+bin/gravity -config mysql2mysql.toml
+```
+从 docker
+```bash
+docker run -v ${PWD}/config.toml:/etc/gravity/config.toml -d --net=host moiot/gravity:latest
 ```
 
-MySQL 源库的 `test`.`test_source_table` 这个表的数据变更会发送到 Kafka 的 `test` 这个 topic。
+## 监控
+Gravity 使用 [Prometheus](https://prometheus.io) 和 [Grafana](https://grafana.com/) 实现监控功能。
+在运行端口（默认8080）上提供了 Prometheus 标准的指标抓取路径`/metrics`。
+在源码路径`deploy/grafana`下提供了 Grafana dashboard 供导入。 

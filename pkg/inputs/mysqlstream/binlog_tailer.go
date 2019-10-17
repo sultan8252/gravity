@@ -9,10 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/moiot/gravity/pkg/position_repos"
-
-	"github.com/moiot/gravity/pkg/inputs/helper"
-
 	"github.com/juju/errors"
 	"github.com/pingcap/parser"
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,10 +20,13 @@ import (
 	"github.com/moiot/gravity/pkg/config"
 	"github.com/moiot/gravity/pkg/consts"
 	"github.com/moiot/gravity/pkg/core"
+	"github.com/moiot/gravity/pkg/env"
+	"github.com/moiot/gravity/pkg/inputs/helper"
 	"github.com/moiot/gravity/pkg/inputs/helper/binlog_checker"
 	"github.com/moiot/gravity/pkg/metrics"
 	"github.com/moiot/gravity/pkg/mysql_test"
 	"github.com/moiot/gravity/pkg/position_cache"
+	"github.com/moiot/gravity/pkg/position_repos"
 	"github.com/moiot/gravity/pkg/schema_store"
 	"github.com/moiot/gravity/pkg/utils"
 )
@@ -265,6 +264,11 @@ func (tailer *BinlogTailer) Start() error {
 
 				schemaName, tableName := string(ev.Table.Schema), string(ev.Table.Table)
 
+				if schemaName == "mysql" {
+					log.Debugf("ignore change from mysql, table=%s", tableName)
+					continue
+				}
+
 				// dead signal is received from special internal table.
 				// it is only used for test purpose right now.
 				isDeadSignal := mysql_test.IsDeadSignal(schemaName, tableName)
@@ -411,29 +415,7 @@ func (tailer *BinlogTailer) Start() error {
 				// If B created the internal txn table _gravity.gravity_txn_tags, but A does not
 				// invalidate the cache, the schema of _gravity.gravity_txn_tags won't be found.
 				//
-				dbName, table, ast := extractSchemaNameFromDDLQueryEvent(tailer.parser, ev)
-				if dbName == consts.MySQLInternalDBName {
-					continue
-				}
-
-				tailer.sourceSchemaStore.InvalidateSchemaCache(dbName)
-
-				if tailer.cfg.IgnoreBiDirectionalData && strings.Contains(ddlSQL, consts.DDLTag) {
-					log.Infof("ignore internal ddl: %s", ddlSQL)
-					continue
-				}
-
-				if dbName == consts.GravityDBName || dbName == consts.OldDrcDBName {
-					continue
-				}
-
-				log.Infof("QueryEvent: database: %s, sql: %s", dbName, ddlSQL)
-
-				if tailer.binlogEventSchemaFilter != nil {
-					if !tailer.binlogEventSchemaFilter(dbName) {
-						continue
-					}
-				}
+				dbNames, tables, asts := extractSchemaNameFromDDLQueryEvent(tailer.parser, ev)
 
 				// emit barrier msg
 				barrierMsg := NewBarrierMsg(tailer.AfterMsgCommit)
@@ -445,20 +427,55 @@ func (tailer *BinlogTailer) Start() error {
 					log.Fatalf("[binlogTailer] failed to flush position cache, err: %v", errors.ErrorStack(err))
 				}
 
-				// emit ddl msg
-				ddlMsg := NewDDLMsg(
-					tailer.AfterMsgCommit,
-					dbName,
-					table,
-					ast,
-					ddlSQL,
-					int64(e.Header.Timestamp),
-					received,
-					currentPosition)
-				if err := tailer.emitter.Emit(ddlMsg); err != nil {
-					log.Fatalf("failed to emit ddl msg: %v", errors.ErrorStack(err))
+				for i := range dbNames {
+					dbName := dbNames[i]
+					table := tables[i]
+					ast := asts[i]
+
+					if dbName == consts.MySQLInternalDBName {
+						continue
+					}
+
+					tailer.sourceSchemaStore.InvalidateSchemaCache(dbName)
+
+					if tailer.cfg.IgnoreBiDirectionalData && strings.Contains(ddlSQL, consts.DDLTag) {
+						log.Infof("ignore internal ddl: %s", ddlSQL)
+						continue
+					}
+
+					if dbName == consts.GravityDBName || dbName == consts.OldDrcDBName {
+						continue
+					}
+
+					log.Infof("QueryEvent: database: %s, sql: %s", dbName, ddlSQL)
+
+					if tailer.binlogEventSchemaFilter != nil {
+						if !tailer.binlogEventSchemaFilter(dbName) {
+							continue
+						}
+					}
+
+					// emit ddl msg
+					ddlMsg := NewDDLMsg(
+						tailer.AfterMsgCommit,
+						dbName,
+						table,
+						ast,
+						ddlSQL,
+						int64(e.Header.Timestamp),
+						received)
+					if err := tailer.emitter.Emit(ddlMsg); err != nil {
+						log.Fatalf("failed to emit ddl msg: %v", errors.ErrorStack(err))
+					}
 				}
-				<-ddlMsg.Done
+
+				// emit barrier msg
+				barrierMsg = NewBarrierMsg(tailer.AfterMsgCommit)
+				barrierMsg.InputContext = inputContext{op: ddl, position: currentPosition}
+				if err := tailer.emitter.Emit(barrierMsg); err != nil {
+					log.Fatalf("failed to emit barrier msg: %v", errors.ErrorStack(err))
+				}
+				<-barrierMsg.Done
 				if err := tailer.positionCache.Flush(); err != nil {
 					log.Fatalf("[binlogTailer] failed to flush position cache, err: %v", errors.ErrorStack(err))
 				}
@@ -537,7 +554,7 @@ func (tailer *BinlogTailer) Start() error {
 
 func (tailer *BinlogTailer) AfterMsgCommit(msg *core.Msg) error {
 	ctx := msg.InputContext.(inputContext)
-	if ctx.op == xid || ctx.op == ddl {
+	if (ctx.op == xid || ctx.op == ddl) && ctx.position.BinlogGTID != "" {
 
 		if err := UpdateCurrentPositionValue(tailer.positionCache, ctx.position); err != nil {
 			return errors.Trace(err)
@@ -574,9 +591,9 @@ func (tailer *BinlogTailer) Wait() {
 func (tailer *BinlogTailer) AppendMsgTxnBuffer(msg *core.Msg) {
 	var c prometheus.Counter
 	if msg.Type == core.MsgDML {
-		c = metrics.InputCounter.WithLabelValues(core.PipelineName, msg.Database, msg.Table, string(msg.Type), string(msg.DmlMsg.Operation))
+		c = metrics.InputCounter.WithLabelValues(env.PipelineName, msg.Database, msg.Table, string(msg.Type), string(msg.DmlMsg.Operation))
 	} else {
-		c = metrics.InputCounter.WithLabelValues(core.PipelineName, msg.Database, msg.Table, string(msg.Type), "")
+		c = metrics.InputCounter.WithLabelValues(env.PipelineName, msg.Database, msg.Table, string(msg.Type), "")
 	}
 	c.Add(1)
 	// do not send messages without router to the system

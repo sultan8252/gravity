@@ -16,6 +16,7 @@ import (
 	"github.com/moiot/gravity/pkg/config"
 	"github.com/moiot/gravity/pkg/consts"
 	"github.com/moiot/gravity/pkg/core"
+	"github.com/moiot/gravity/pkg/env"
 	"github.com/moiot/gravity/pkg/metrics"
 	"github.com/moiot/gravity/pkg/outputs/routers"
 	"github.com/moiot/gravity/pkg/registry"
@@ -212,6 +213,29 @@ func (output *MySQLOutput) Execute(msgs []*core.Msg) error {
 				tmp.Table.Schema = model.CIStr{
 					O: targetSchema,
 				}
+
+				//handle create table like if the referenced table has been renamed
+				if tmp.ReferTable != nil {
+					var refSchema string
+					var refTable string
+					found := false
+					fakeMsg := core.Msg{
+						Database: tmp.ReferTable.Schema.O,
+						Table:    tmp.ReferTable.Name.O,
+					}
+					for _, route := range output.routes {
+						if route.Match(&fakeMsg) {
+							found = true
+							refSchema, refTable = route.GetTarget(fakeMsg.Database, fakeMsg.Table)
+							break
+						}
+					}
+					if found {
+						tmp.ReferTable.Schema = model.CIStr{O: refSchema}
+						tmp.ReferTable.Name = model.CIStr{O: refTable}
+					}
+				}
+
 				tmp.IfNotExists = true
 				stmt := restore(&tmp)
 				err := output.executeDDL(targetSchema, stmt)
@@ -386,7 +410,7 @@ func splitMsgBatchWithDelete(msgBatch []*core.Msg) [][]*core.Msg {
 }
 
 func (output *MySQLOutput) executeDDL(targetSchema, stmt string) error {
-	stmt = consts.DDLTag + fmt.Sprintf("/*%s*/", core.PipelineName) + stmt
+	stmt = consts.DDLTag + fmt.Sprintf("/*%s*/", env.PipelineName) + stmt
 	if targetSchema != "" {
 		tx, err := output.db.Begin()
 		if err != nil {
